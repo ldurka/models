@@ -19,6 +19,11 @@
 #
 
 from argparse import ArgumentTypeError
+try:
+    from urllib.parse import urlparse
+except ImportError:
+    from urlparse import urlparse
+
 import os
 
 """
@@ -84,6 +89,9 @@ def check_valid_folder(value):
 def check_valid_file_or_dir(value):
     """verfies file/dir exists and isn't a link"""
     if value is not None:
+        if urlparse(value).scheme:
+            return value
+
         if not os.path.exists(value):
             raise ArgumentTypeError("{} does not exist.".format(value))
         check_for_link(value)

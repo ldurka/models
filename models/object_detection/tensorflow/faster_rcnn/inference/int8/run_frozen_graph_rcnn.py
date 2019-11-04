@@ -27,13 +27,15 @@ import tensorflow as tf
 import zipfile
 
 from collections import defaultdict
-from io import StringIO
+from io import StringIO, BytesIO
 import matplotlib
 matplotlib.use('Agg')
 from matplotlib import pyplot as plt
 from PIL import Image
+from kafka import KafkaConsumer
 import time
 import argparse
+from urllib.parse import urlparse, parse_qsl
 from tensorflow.python.client import timeline
 
 
@@ -99,12 +101,50 @@ def load_image_into_numpy_array(image):
     return np.array(image.getdata()).reshape(
         (im_height, im_width, 3)).astype(np.uint8)
 
-if (args.single_image):
+def images(images):
+  index = 0
+  for data in images:
+    if isinstance(data, str):
+      image = Image.open(data)
+      # the array based representation of the image will be used later in order to prepare the
+      # result image with boxes and labels on it.
+    else:
+      # load from remote broker
+      image = Image.open(BytesIO(data.value))
 
-  #TEST_IMAGE_PATHS = ["/mnt/nrvlab_300G_work01/mabuzain/tensorflow-models/research/object_detection/data/val2017/000000578871.jpg"]
-  TEST_IMAGE_PATHS = [args.dataset + "/000000578871.jpg"]  
+    image_np = load_image_into_numpy_array(image)
+    yield index, image_np
+    index += 1
+
+uri = urlparse(args.dataset)
+if uri.scheme and uri.hostname:
+  # Connect to kafka broker
+  # <protocol>://password:<user@>broker:port|9092/topic<?option=value&option&value>
+  # i.e. kafka://ip_or_hostname/topic_if?options
+  if str(uri.scheme).lower() != "kafka":
+    raise Exception("Only Kafka broker supported.")
+
+  topic = str(uri.path).strip("/")
+  config = {
+    "bootstrap_servers": f"{uri.hostname}:{uri.port}" if uri.port else uri.hostname,
+    "sasl_plain_username": getattr(uri, "username") if getattr(uri, "username") else KafkaConsumer.DEFAULT_CONFIG.get("sasl_plain_username"),
+    "sasl_plain_password": getattr(uri, "password") if getattr(uri, "password") else KafkaConsumer.DEFAULT_CONFIG.get("sasl_plain_password"),
+    "group_id": topic,
+    "auto_offset_reset": "earliest",
+    "enable_auto_commit": True,
+    "consumer_timeout_ms": 50000
+  }
+  # update arguments from uri query
+  for key, value in parse_qsl(uri.query):
+    config[key] = value
+
+  TEST_IMAGE_PATHS = KafkaConsumer(topic, **config)
+elif (args.single_image):
+  if "kafka" in str(args.dataset).lower():
+    raise Exception("Only disk path supports one image approach.")
+  TEST_IMAGE_PATHS = [args.dataset + "/000000578871.jpg"]
 else:
-  PATH_TO_TEST_IMAGES_DIR = args.dataset 
+  PATH_TO_TEST_IMAGES_DIR = args.dataset
   print(PATH_TO_TEST_IMAGES_DIR)
   #PATH_TO_TEST_IMAGES_DIR = '/mnt/nrvlab_300G_work01/mabuzain/tensorflow-models/research/object_detection/data/val2017'
   TEST_IMAGE_PATHS = []
@@ -123,7 +163,7 @@ def run_inference_for_single_image(graph):
   sess_config.intra_op_parallelism_threads = args.num_intra_threads
   sess_config.inter_op_parallelism_threads = args.num_inter_threads
   if not os.environ.get("OMP_NUM_THREADS"):
-    os.environ["OMP_NUM_THREADS"] = args.num_intra_threads
+    os.environ["OMP_NUM_THREADS"] = str(args.num_intra_threads)
 
   with graph.as_default():
     with tf.Session(config=sess_config) as sess:
@@ -134,7 +174,7 @@ def run_inference_for_single_image(graph):
         all_tensor_names = {output.name for op in ops for output in op.outputs}
         for key in [
             'num_detections', 'detection_boxes', 'detection_scores',
-            'detection_classes' 
+            'detection_classes'
         ]:
           tensor_name = key + ':0'
           if tensor_name in all_tensor_names:
@@ -152,11 +192,7 @@ def run_inference_for_single_image(graph):
         run_options = tf.RunOptions(trace_level=tf.RunOptions.FULL_TRACE)
         run_metadata = tf.RunMetadata()
       total_duration = 0
-      for index, image_path in enumerate(TEST_IMAGE_PATHS):
-        image = Image.open(image_path)
-        # the array based representation of the image will be used later in order to prepare the
-        # result image with boxes and labels on it.
-        image_np = load_image_into_numpy_array(image)
+      for index, image_np in images(TEST_IMAGE_PATHS):
         image_tensor = tf.get_default_graph().get_tensor_by_name('image_tensor:0')
 
         # Run inference
@@ -171,21 +207,13 @@ def run_inference_for_single_image(graph):
         if(index > 20):
           total_duration = total_duration + step_duration
 
-        if (args.single_image):
-          if index == 0:
-            print ('Avg. Duration per Step:' + str(total_duration / 1))
-        else:
-          if (index % 10 == 0):
-            print ('Step ' + str(index) + ': ' + str(step_duration) + ' seconds')
-          if index == 4999:
-            print ('Avg. Duration per Step:' + str(total_duration / 5000))
+        if (index % 10 == 0 and  index > 0):
+          print ('Step ' + str(index) + ': ' + str(step_duration) + ' seconds')
 
         if (args.number_of_steps is not None):
           if (args.single_image):
-            sys.exit("single_iamge and number_of_steps cannot be both enabled!")
+            sys.exit("single_image and number_of_steps cannot be both enabled!")
           elif (index == (args.number_of_steps - 1)):
-            print ('Avg. Duration per Step:' +
-                   str(total_duration / (args.number_of_steps - 20)))
             break
 
         if (args.timeline is not None):
@@ -196,7 +224,7 @@ def run_inference_for_single_image(graph):
 
         if (args.evaluate_tensor is not None):
           for tensor in output_dict[args.evaluate_tensor]:
-            print tensor.shape
+            print(tensor.shape)
           return None, None
 
         # all outputs are float32 numpy arrays, so convert types as appropriate
@@ -214,6 +242,14 @@ def run_inference_for_single_image(graph):
 
         if 'detection_masks' in output_dict:
           output_dict['detection_masks'] = output_dict['detection_masks'][0]
+
+      if index % 10 != 0:
+        print('Step ' + str(index) + ': ' + str(step_duration) + ' seconds')
+      # for single image option use step duration
+      # for multiple images use total duration add 1 becouse index stats with 0 and substract 20 warmup steps
+      steps, duration = (1, step_duration) if args.single_image else ((index + 1 - 20), total_duration)
+      print('Avg. Duration per Step:' + str(duration / steps))
+
   return output_dict, image_np
 
 
