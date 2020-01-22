@@ -248,7 +248,7 @@ def run_inference_for_single_image(graph):
       # for single image option use step duration
       # for multiple images use total duration add 1 becouse index stats with 0 and substract 20 warmup steps
       steps, duration = (1, step_duration) if args.single_image else ((index + 1 - 20), total_duration)
-      print('Avg. Duration per Step:' + str(duration / steps))
+      print('Avg. Duration per Step:' + str(duration / steps) + 'for processed number of steps' + str(steps))
 
   return output_dict, image_np
 
